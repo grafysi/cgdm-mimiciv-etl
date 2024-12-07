@@ -1,0 +1,146 @@
+server_uri: bolt://localhost:7687
+database: medverse
+admin_user: snowj
+admin_pass: abcd1234
+files:
+  # 11-pharmacy-p1.cql
+  - url: file:///var/lib/neo4j/import/custom_partitions/pharmacy_datetimes.csv
+    mode: sync
+    thread_count: 1
+    chunk_size: 5000
+    log_step: 200
+    cql: |
+      WITH $dict.rows as rows UNWIND rows as row
+      match (pa:Patient {id:toInteger(row.subject_id)})
+      with pa, row,
+          datetime({epochseconds:apoc.date.parse(row.starttime, 's', 'yyyy-MM-dd HH:mm:ss')}) - pa.shiftedYears as starttime,
+          case when row.stoptime is not null and row.stoptime <> ""
+              then datetime({epochseconds:apoc.date.parse(row.stoptime, 's', 'yyyy-MM-dd HH:mm:ss')}) - pa.shiftedYears else null end as endtime
+  
+      merge (startAnc:Anchor {id:row.subject_id + "-" + starttime.epochSeconds})
+          on create
+          set startAnc.value = starttime
+  
+      with pa, row, endtime
+      where endtime is not null
+      merge (endAnc:Anchor {id:row.subject_id + "-" + endtime.epochSeconds})
+          on create
+          set endAnc.value = endtime
+      
+  # 11-pharmacy-p2.cql
+  - url: file:///var/lib/neo4j/import/mimiciv/2.2/hosp/pharmacy.csv
+    mode: async
+    thread_count: 20
+    chunk_size: 5000
+    log_step: 200
+    cql: |
+      WITH $dict.rows as rows UNWIND rows as row
+      match (rs:RefSet {id:2105})
+      match (lc:LocalConcept {id:rs.code + '|' + row.proc_type})
+  
+      match (flagRs:RefSet {id:2401})
+      match (flag:LocalConcept {id:flagRs.code + '|' + row.status})
+  
+      match (pa:Patient {id:toInteger(row.subject_id)})
+      with row, lc, flag,
+          case when row.starttime is not null and row.starttime <> ""
+              then datetime({epochseconds: apoc.date.parse(row.starttime, 's', 'yyyy-MM-dd HH:mm:ss')}) - pa.shiftedYears
+              else datetime({epochseconds: apoc.date.parse(row.entertime, 's', 'yyyy-MM-dd HH:mm:ss')}) - pa.shiftedYears
+              end as starttime,
+          case when row.stoptime is not null and row.stoptime <> ""
+              then datetime({epochseconds: apoc.date.parse(row.stoptime, 's', 'yyyy-MM-dd HH:mm:ss')}) - pa.shiftedYears
+              else null
+              end as endtime,
+          case when trim(row.medication) is not null and trim(row.medication) <> '' then true else false end as hasMainRx,
+          case when row.frequency is not null and row.frequency <> '' then row.frequency else null end as frequency,
+          case when row.disp_sched is not null and row.disp_sched <> '' then row.disp_sched else null end as disp_sched,
+          case when row.infusion_type is not null and row.infusion_type <> '' then row.infusion_type else null end as infusion_type,
+          case when row.sliding_scale is not null and row.sliding_scale <> '' then row.sliding_scale else null end as sliding_scale,
+          case when row.lockout_interval is not null and row.lockout_interval <> '' then row.lockout_interval else null end as lockout_interval,
+          case when row.basal_rate is not null and row.basal_rate <> '' then row.basal_rate else null end as basal_rate,
+          case when row.one_hr_max is not null and row.one_hr_max <> '' then row.one_hr_max else null end as one_hr_max,
+          case when row.doses_per_24_hrs is not null and row.doses_per_24_hrs <> '' then row.doses_per_24_hrs else null end as doses_per_24_hrs,
+          case when row.duration is not null and row.duration <> '' then row.duration else null end as duration,
+          case when row.duration_interval is not null and row.duration_interval <> '' then row.duration_interval else null end as duration_interval,
+          case when row.expiration_value is not null and row.expiration_value <> '' then row.expiration_value else null end as expiration_value,
+          case when row.expiration_unit is not null and row.expiration_unit <> '' then row.expiration_unit else null end as expiration_unit,
+          case when row.fill_quantity is not null and row.fill_quantity <> '' then row.fill_quantity else null end as fill_quantity
+  
+  
+      create (med:Medication {id:toInteger(row.pharmacy_id)})
+          set med.valueFlag1 = flag.value,
+              med.hasMainRx = hasMainRx,
+              med.frequency = frequency,
+              med.dispSched = disp_sched,
+              med.infusionType = infusion_type,
+              med.slidingScale = sliding_scale,
+              med.lockoutInterval = lockout_interval,
+              med.basalRate = toFloat(basal_rate),
+              med.oneHrMax = one_hr_max,
+              med.dosesPer24Hrs = toFloat(doses_per_24_hrs),
+              med.duration = toFloat(duration),
+              med.durationInterval = duration_interval,
+              med.expirationValue = toInteger(expiration_value),
+              med.expirationUnit = expiration_unit
+  
+      with row, lc, starttime, endtime, med
+  
+      match (startAnc:Anchor {id: row.subject_id + '-' + starttime.epochSeconds})
+      match (endAnc:Anchor {id: coalesce(row.subject_id + '-' + endtime.epochSeconds, "UNDEFINED_UPPER")})
+      match (vis:Visit {id:row.hadm_id})
+  
+      with row, lc, med, starttime, startAnc, endAnc
+      create (med)-[:OF_ITEM]->(lc)
+      create (med)-[:STARTED]->(startAnc)
+      create (med)-[:ENDED]->(endAnc)
+      create (vis)-[:HAS_MED]->(med)
+
+  # 12-prescriptions.cql
+  - url: file:///var/lib/neo4j/import/mimiciv/2.2/hosp/prescriptions.csv
+    mode: async
+    thread_count: 20
+    chunk_size: 5000
+    log_step: 200
+    cql: |
+      WITH $dict.rows as rows UNWIND rows as row
+      match (med:Medication {id: toInteger(row.pharmacy_id)})
+
+      match (drugRs:RefSet {id:2101})
+      match (drug:LocalConcept {id: drugRs.code + '|' + trim(row.drug)})
+  
+      match (prodStrRs:RefSet {id:2103})
+      match (routeRs:RefSet {id:2102})
+      match (unitRs:RefSet {id:2201})
+  
+      with row, med, drug,
+          case when trim(row.prod_strength) is not null and trim(row.prod_strength) <> '' then prodStrRs.code + '|' + trim(row.prod_strength) else "UNDEF|ALL" end as prod_str_id,
+          case when trim(row.route) is not null and trim(row.route) <> '' then routeRs.code + '|' + trim(row.route) else "UNDEF|ALL" end as route_id,
+          case when trim(row.dose_unit_rx) is not null and trim(row.dose_unit_rx) <> '' then unitRs.code + '|' + trim(row.dose_unit_rx) else "UNDEF|ALL" end as dose_unit_id,
+          case when trim(row.form_unit_disp) is not null and trim(row.form_unit_disp) <> '' then unitRs.code + '|' + trim(row.form_unit_disp) else "UNDEF|ALL" end as form_unit_id
+  
+      match (doseUnit:LocalConcept {id: dose_unit_id})
+      match (formUnit:LocalConcept {id: form_unit_id})
+      match (prodStr:LocalConcept {id: prod_str_id})
+      match (route:LocalConcept {id: route_id})
+  
+      with row, med, drug,
+          case when doseUnit.value <> 0 then doseUnit.value else null end as dose_unit_value,
+          case when formUnit.value <> 0 then formUnit.value else null end as form_unit_value,
+          case when prodStr.value <> 0 then prodStr.value else null end as prod_str_value,
+          case when route.value <> 0 then route.value else null end as route_value
+  
+      create (rx:Prescription)
+          set rx.valueProdStr = prod_str_value,
+              rx.valueDUnit = dose_unit_value,
+              rx.valueFUnit = form_unit_value,
+              rx.valueRoute = route_value,
+              rx.valueDose = toFloat(split(row.dose_val_rx, '-')[0]),
+              rx.valueDoseUpto = toFloat(split(row.dose_val_rx, '-')[1]),
+              rx.valueForm = toFloat(split(row.form_val_disp, '-')[0]),
+              rx.valueFormUpto = toFloat(split(row.form_val_disp, '-')[1]),
+              rx.dosesPer24Hrs = toFloat(row.doses_per_24_hrs)
+  
+      with row, med, drug, rx
+      call apoc.create.setLabels(rx, ["Prescription", trim(row.drug_type)]) yield node
+      create (med)-[:HAS_SEQ]->(rx)
+      create (rx)-[:OF_DRUG]->(drug)
